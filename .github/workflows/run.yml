@@ -1,22 +1,38 @@
-name: 终极搬砖机器人
+name: 10TB全量自动大搬迁
 
 on:
   workflow_dispatch:
+  schedule:
+    # 每天北京时间 0点、6点、12点、18点 自动启动，实现 24 小时全天候无缝接力
+    - cron: '0 0,6,12,18 * * *'
 
 jobs:
   Transfer:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 安装工具
+      - name: 1. 环境初始化
         run: curl -s https://rclone.org/install.sh | sudo bash > /dev/null 2>&1
 
-      - name: 2. 配置账号
+      - name: 2. 注入保险柜凭证
         run: |
           mkdir -p ~/.config/rclone
-          rclone config create pikpak pikpak user "leyuanw560@gmail.com" pass "1796629243sky" > /dev/null 2>&1
-          rclone config create 123pan webdav url "https://webdav.123pan.cn/webdav" vendor "other" user "15345447515" pass "eccuswyc" headers "User-Agent,Mozilla/5.0" > /dev/null 2>&1
+          rclone config create pikpak pikpak user "${{ secrets.PIKPAK_USER }}" pass "${{ secrets.PIKPAK_PASS }}" > /dev/null 2>&1
+          rclone config create 123pan webdav url "https://webdav.123pan.cn/webdav" vendor "other" user "${{ secrets.PAN123_USER }}" pass "${{ secrets.PAN123_PASS }}" headers "User-Agent,Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" > /dev/null 2>&1
 
-      - name: 3. 全自动无缝搬运 (加速版)
+      - name: 3. 执行高强度增量同步
         run: |
-          # 加上了 --size-only 极大加快比对速度，跳过昨晚已传的 200G
-          rclone copy "pikpak:/动漫" "123pan:/PikPak中转站/动漫" --size-only --stats 60s --transfers 4 --checkers 8 --tpslimit 8 --exclude "*.torrent" --exclude "*.txt" --ignore-errors --retries 5
+          # 核心参数：
+          # --ignore-checksum: 强力解决 405 报错，只看大小不校验
+          # --size-only: 秒速跳过已传输的 300G
+          # --fast-list: 针对 10TB 海量文件优化扫描速度
+          rclone copy "pikpak:/" "123pan:/PikPak全量备份" \
+            --size-only \
+            --ignore-checksum \
+            --fast-list \
+            --transfers 4 \
+            --checkers 8 \
+            --tpslimit 8 \
+            --stats 60s \
+            --ignore-errors \
+            --retries 5 \
+            --timeout 5m
