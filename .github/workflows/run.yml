@@ -3,7 +3,7 @@ name: 10TB全量自动大搬迁
 on:
   workflow_dispatch:
   schedule:
-    # 每天北京时间 0点、6点、12点、18点 自动启动，实现 24 小时全天候无缝接力
+    # 每天北京时间 0点、6点、12点、18点 自动启动
     - cron: '0 0,6,12,18 * * *'
 
 jobs:
@@ -16,15 +16,14 @@ jobs:
       - name: 2. 注入保险柜凭证
         run: |
           mkdir -p ~/.config/rclone
+          # PikPak 配置
           rclone config create pikpak pikpak user "${{ secrets.PIKPAK_USER }}" pass "${{ secrets.PIKPAK_PASS }}" > /dev/null 2>&1
-          rclone config create 123pan webdav url "https://webdav.123pan.cn/webdav" vendor "other" user "${{ secrets.PAN123_USER }}" pass "${{ secrets.PAN123_PASS }}" headers "User-Agent,Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" > /dev/null 2>&1
+          # 123云盘 配置 (修复了 User-Agent 导致的奇数报错)
+          rclone config create 123pan webdav url "https://webdav.123pan.cn/webdav" vendor "other" user "${{ secrets.PAN123_USER }}" pass "${{ secrets.PAN123_PASS }}" headers "User-Agent,Mozilla/5.0" > /dev/null 2>&1
 
       - name: 3. 执行高强度增量同步
         run: |
-          # 核心参数：
-          # --ignore-checksum: 强力解决 405 报错，只看大小不校验
-          # --size-only: 秒速跳过已传输的 300G
-          # --fast-list: 针对 10TB 海量文件优化扫描速度
+          # 开启 10TB 大迁移
           rclone copy "pikpak:/" "123pan:/PikPak全量备份" \
             --size-only \
             --ignore-checksum \
@@ -33,6 +32,10 @@ jobs:
             --checkers 8 \
             --tpslimit 8 \
             --stats 60s \
+            --ignore-errors \
+            --retries 5 \
+            --timeout 5m
+
             --ignore-errors \
             --retries 5 \
             --timeout 5m
