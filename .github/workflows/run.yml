@@ -7,15 +7,18 @@ jobs:
   Transfer:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 静默安装 Rclone
+      - name: 1. 安装工具
         run: curl -s https://rclone.org/install.sh | sudo bash > /dev/null 2>&1
 
-      - name: 2. 配置通行证
+      - name: 2. 配置账号
         run: |
           mkdir -p ~/.config/rclone
           rclone config create pikpak pikpak user "leyuanw560@gmail.com" pass "1796629243sky" > /dev/null 2>&1
           rclone config create 123pan webdav url "https://webdav.123pan.cn/webdav" vendor "other" user "15345447515" pass "eccuswyc" headers "User-Agent,Mozilla/5.0" > /dev/null 2>&1
 
-      - name: 3. 开始微软云端满血搬运
+      - name: 3. 连通性测试 (看看到底卡在哪里)
         run: |
-          rclone copy "pikpak:/动漫" "123pan:/PikPak中转站/动漫" --stats 60s --transfers 4 --checkers 8 --tpslimit 8 --exclude "*.torrent" --exclude "*.txt" --ignore-errors --retries 5
+          echo ">>> 正在测试连接 PikPak..."
+          rclone lsd "pikpak:/" --retries 1
+          echo ">>> 正在测试连接 123云盘..."
+          rclone lsd "123pan:/" --retries 1
