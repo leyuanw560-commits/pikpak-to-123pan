@@ -1,7 +1,7 @@
-name: 🚀 专属行动：批量洗名字
+name: 🚀 专属行动：批量洗名字 (自动修复版)
 
 on:
-  workflow_dispatch: # 只允许手动点击运行
+  workflow_dispatch:
 
 jobs:
   rename_job:
@@ -11,11 +11,18 @@ jobs:
         run: |
           sudo -v ; curl https://rclone.org/install.sh | sudo bash
 
-      - name: 2. 注入保险柜凭证 (读取配置)
+      - name: 2. 注入保险柜凭证 (智能诊断)
         run: |
           mkdir -p ~/.config/rclone
-          # 默认读取你仓库里存好的 RCLONE_CONF 密钥
-          echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
+          # 💡 这里我同时尝试读取两个常见的密钥名字，防止你起错名
+          CONF_DATA="${{ secrets.RCLONE_CONF }}${{ secrets.RCLONE_CONFIG }}"
+          if [ -z "$CONF_DATA" ]; then
+            echo "❌ 警告：没读到任何密钥数据！请检查 GitHub Secrets 里名字是否为 RCLONE_CONF"
+            exit 1
+          fi
+          echo "$CONF_DATA" > ~/.config/rclone/rclone.conf
+          echo "✅ 配置注入成功！目前认识的网盘有："
+          rclone listremotes
 
       - name: 3. 终极批量洗名字 (演习模式)
         shell: python
@@ -24,50 +31,51 @@ jobs:
           import json
           import os
 
-          # 🎯 目标文件夹已经锁定
-          TARGET_DIR = "pikpak:/#AndMlove"
+          # 🔍 第一步：自动寻找 PikPak 的真实名字
+          print("🕵️ 正在匹配你的网盘名称...")
+          remote_list = subprocess.run(['rclone', 'listremotes'], capture_output=True, text=True).stdout
+          remotes = [r.strip(':') for r in remote_list.split()]
           
-          # 🛡️ 安全开关：False为演习预览，True为正式动刀
+          # 寻找名字里包含 pikpak 的那个（不区分大小写）
+          real_remote = next((r for r in remotes if r.lower() == 'pikpak'), None)
+          
+          if not real_remote:
+              print(f"❌ 报错：在你的配置里没找到任何叫 PikPak 的网盘！当前已有：{remotes}")
+              exit(1)
+          
+          print(f"✅ 找到目标网盘：[{real_remote}]")
+          TARGET_DIR = f"{real_remote}:/#AndMlove"
+          
+          # 🛡️ 演习模式开关
           DO_RENAME = False
 
-          print(f"🔍 正在深度穿透扫描 [{TARGET_DIR}] 及其所有子文件夹...")
+          print(f"🔍 正在扫描 [{TARGET_DIR}]...")
           cmd = ['rclone', 'lsjson', '-R', TARGET_DIR]
           result = subprocess.run(cmd, capture_output=True, text=True)
-
+          
           if result.returncode != 0:
-              print("❌ 读取失败，请检查路径是否拼写正确。")
-              print(result.stderr)
+              print("❌ 读取路径失败，请确认 #AndMlove 文件夹是否存在。")
               exit(1)
 
           files = json.loads(result.stdout)
           counter = 1
-
           print("\n--- 📋 预计改名清单 ---")
           for f in files:
               if not f['IsDir']:  
                   relative_path = f['Path'] 
                   dir_name = os.path.dirname(relative_path)
                   ext = os.path.splitext(relative_path)[1] 
-                  
                   new_name = f"{counter}{ext}"
-                  
-                  if dir_name:
-                      new_relative_path = f"{dir_name}/{new_name}"
-                  else:
-                      new_relative_path = new_name
-                      
+                  new_relative_path = f"{dir_name}/{new_name}" if dir_name else new_name
                   old_full_path = f"{TARGET_DIR}/{relative_path}"
                   new_full_path = f"{TARGET_DIR}/{new_relative_path}"
-                  
                   print(f"📝 {relative_path}  -->  {new_relative_path}")
-                  
                   if DO_RENAME:
                       subprocess.run(['rclone', 'moveto', old_full_path, new_full_path])
-                      
                   counter += 1
 
           print("------------------------")
           if not DO_RENAME:
-              print(f"\n✅ 演习扫描完毕！预计将把 {counter - 1} 个文件打上数字编号。")
+              print(f"\n✅ 演习完毕！找到 {counter - 1} 个文件。")
           else:
-              print(f"\n🎉 搞定！改名完成。")
+              print(f"\n🎉 搞定！")
