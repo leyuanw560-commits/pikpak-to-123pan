@@ -1,81 +1,156 @@
-name: 🚀 专属行动：批量洗名字 (自动修复版)
+name: 10TB 全量自动大搬迁
 
 on:
   workflow_dispatch:
+    inputs:
+      force_full:
+        description: '强制全量扫描（跳过--max-age 限制）'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+  schedule:
+    # ✅ 已修正为北京时间 0 点、6 点、12 点、18 点 (GitHub Actions 使用 UTC 时间)
+    # 北京时间 00:00 = UTC 16:00 (前一天)
+    # 北京时间 06:00 = UTC 22:00 (前一天)
+    # 北京时间 12:00 = UTC 04:00
+    # 北京时间 18:00 = UTC 10:00
+    - cron: '0 16,22,4,10 * * *'
 
 jobs:
-  rename_job:
+  Transfer:
     runs-on: ubuntu-latest
+    # ⚠️ 设置 350 分钟超时，预留 10 分钟给重触发逻辑，避免 GitHub 硬杀死导致无法执行后续步骤
+    timeout-minutes: 350
+    env:
+      # 🎯 动态比对窗口：首次/强制全量为 0，日常增量仅同步最近 24 小时修改的文件
+      # 这能确保日常任务在 6 小时内必能完成，避免超时
+      MAX_AGE_HOURS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_full == 'true' && '0' || '24' }}
+      # 📍 远程状态文件路径（用于记录上次全量同步时间）
+      STATE_FILE: "PikPak 全量备份/.rclone_state"
     steps:
-      - name: 1. 环境初始化 (安装 Rclone)
+      - name: 1. 环境初始化
         run: |
-          sudo -v ; curl https://rclone.org/install.sh | sudo bash
+          echo "🔧 初始化环境 [$(date '+%Y-%m-%d %H:%M:%S')]"
+          curl -s https://rclone.org/install.sh | sudo bash > /dev/null 2>&1
+          rclone version
+          mkdir -p ~/rclone_logs
+          echo "RUN_START_TS=$(date +%s)" >> $GITHUB_ENV
 
-      - name: 2. 注入保险柜凭证 (智能诊断)
+      - name: 2. 注入保险柜凭证
         run: |
           mkdir -p ~/.config/rclone
-          # 💡 这里我同时尝试读取两个常见的密钥名字，防止你起错名
-          CONF_DATA="${{ secrets.RCLONE_CONF }}${{ secrets.RCLONE_CONFIG }}"
-          if [ -z "$CONF_DATA" ]; then
-            echo "❌ 警告：没读到任何密钥数据！请检查 GitHub Secrets 里名字是否为 RCLONE_CONF"
-            exit 1
+          # 🔐 PikPak 配置 (完全保持原样)
+          rclone config create pikpak pikpak user "${{ secrets.PIKPAK_USER }}" pass "${{ secrets.PIKPAK_PASS }}" > /dev/null 2>&1
+          # 🔐 123 云盘 配置 (完全保持原样)
+          rclone config create 123pan webdav url "https://webdav.123pan.cn/webdav" vendor "other" user "${{ secrets.PAN123_USER }}" pass "${{ secrets.PAN123_PASS }}" headers "User-Agent,Mozilla/5.0" > /dev/null 2>&1
+          echo "✅ 凭证注入完成"
+
+      - name: 3. 读取同步状态（计算 --max-age）
+        id: state        run: |
+          MAX_AGE_FLAG=""
+          
+          # 如果强制全量，跳过状态检查
+          if [[ "${{ env.MAX_AGE_HOURS }}" == "0" ]]; then
+            echo "🔥 强制全量扫描模式"
+            echo "max_age_flag=" >> $GITHUB_OUTPUT
+            exit 0
           fi
-          echo "$CONF_DATA" > ~/.config/rclone/rclone.conf
-          echo "✅ 配置注入成功！目前认识的网盘有："
-          rclone listremotes
+          
+          # 尝试读取远程状态文件中的最后全量时间戳
+          LAST_FULL_TS=$(rclone cat "123pan:/${{ env.STATE_FILE }}" 2>/dev/null | grep "last_full_sync" | cut -d'=' -f2 || echo "0")
+          NOW_TS=$(date +%s)
+          DAYS_SINCE_FULL=$(( (NOW_TS - LAST_FULL_TS) / 86400 ))
+          
+          # 如果超过 7 天未全量校验，本次自动升级为全量
+          if [[ $DAYS_SINCE_FULL -ge 7 ]]; then
+            echo "📅 距上次全量校验已 $DAYS_SINCE_FULL 天，本次执行全量扫描"
+            echo "max_age_flag=" >> $GITHUB_OUTPUT
+            # 更新状态（记录本次为全量）
+            echo "last_full_sync=$NOW_TS" > ~/state_tmp.txt
+            rclone copyto ~/state_tmp.txt "123pan:/${{ env.STATE_FILE }}" --force 2>/dev/null || true
+          else
+            # 日常模式：只同步最近 MAX_AGE_HOURS 小时修改的文件
+            echo "⚡ 增量模式：仅比对最近 ${{ env.MAX_AGE_HOURS }}h 修改的文件"
+            echo "max_age_flag=--max-age ${{ env.MAX_AGE_HOURS }}h" >> $GITHUB_OUTPUT
+          fi
 
-      - name: 3. 终极批量洗名字 (演习模式)
-        shell: python
+      - name: 4. 执行断点续传同步
+        id: sync
         run: |
-          import subprocess
-          import json
-          import os
+          echo "🚀 开始同步 [$(date '+%Y-%m-%d %H:%M:%S')]"
+          echo "📍 源：pikpak:/  →  目标：123pan:/PikPak 全量备份"
+          
+          # 🎯 核心参数组合：幂等 + 高效 + 断点友好
+          RCLONE_CMD="rclone copy pikpak:/ 123pan:/PikPak 全量备份
+            --size-only
+            --ignore-checksum
+            --fast-list
+            --no-traverse
+            --transfers 4
+            --checkers 8
+            --tpslimit 8
+            --buffer-size 64M
+            --stats 60s
+            --stats-file-name-length 0
+            --ignore-errors
+            --retries 3
+            --retries-sleep 15s
+            --timeout 10m            --contimeout 30s
+            --log-file ~/rclone_logs/sync_\$(date '+%Y%m%d_%H%M').log
+            --log-level INFO"
+          
+          # 添加动态 --max-age 参数（如果状态步骤输出）
+          if [[ -n "${{ steps.state.outputs.max_age_flag }}" ]]; then
+            RCLONE_CMD="$RCLONE_CMD ${{ steps.state.outputs.max_age_flag }}"
+            echo "📋 附加参数：${{ steps.state.outputs.max_age_flag }}"
+          fi
+          
+          # 执行同步（捕获退出码）
+          bash -c "$RCLONE_CMD"
+          EXIT_CODE=$?
+          
+          echo "📊 同步结束 [$(date '+%Y-%m-%d %H:%M:%S')] | 退出码：$EXIT_CODE"
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # ⚠️ 如果是超时被杀 (137) 或临时错误 (1-127)，标记需要重跑
+          if [[ $EXIT_CODE -eq 137 ]] || [[ $EXIT_CODE -gt 0 && $EXIT_CODE -lt 128 ]]; then
+            echo "need_retry=true" >> $GITHUB_OUTPUT
+            echo "⚠️ 检测到异常退出，将触发自动重跑"
+          else
+            echo "need_retry=false" >> $GITHUB_OUTPUT
+          fi
+          
+          exit $EXIT_CODE
 
-          # 🔍 第一步：自动寻找 PikPak 的真实名字
-          print("🕵️ 正在匹配你的网盘名称...")
-          remote_list = subprocess.run(['rclone', 'listremotes'], capture_output=True, text=True).stdout
-          remotes = [r.strip(':') for r in remote_list.split()]
+      - name: 5. 自动重触发（断点续传关键 🔑）
+        if: always() && steps.sync.outputs.need_retry == 'true'
+        run: |
+          echo "🔄 触发自动重跑机制..."
           
-          # 寻找名字里包含 pikpak 的那个（不区分大小写）
-          real_remote = next((r for r in remotes if r.lower() == 'pikpak'), None)
+          # 调用 GitHub API 重新触发当前 workflow
+          # 新任务会继承相同参数，rclone copy 自动跳过已同步文件 = 断点续传
+          curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches \
+            -d '{
+              "ref": "${{ github.ref }}",
+              "inputs": {
+                "force_full": "false"
+              }
+            }'
           
-          if not real_remote:
-              print(f"❌ 报错：在你的配置里没找到任何叫 PikPak 的网盘！当前已有：{remotes}")
-              exit(1)
-          
-          print(f"✅ 找到目标网盘：[{real_remote}]")
-          TARGET_DIR = f"{real_remote}:/#AndMlove"
-          
-          # 🛡️ 演习模式开关
-          DO_RENAME = False
+          echo "✅ 重触发请求已发送，新任务将从断点继续匹配文件"
 
-          print(f"🔍 正在扫描 [{TARGET_DIR}]...")
-          cmd = ['rclone', 'lsjson', '-R', TARGET_DIR]
-          result = subprocess.run(cmd, capture_output=True, text=True)
+      - name: 6. 上传同步日志        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-logs-run-${{ github.run_number }}
+          path: ~/rclone_logs/*.log
+          retention-days: 3
+          if-no-files-found: ignore
+
           
-          if result.returncode != 0:
-              print("❌ 读取路径失败，请确认 #AndMlove 文件夹是否存在。")
-              exit(1)
-
-          files = json.loads(result.stdout)
-          counter = 1
-          print("\n--- 📋 预计改名清单 ---")
-          for f in files:
-              if not f['IsDir']:  
-                  relative_path = f['Path'] 
-                  dir_name = os.path.dirname(relative_path)
-                  ext = os.path.splitext(relative_path)[1] 
-                  new_name = f"{counter}{ext}"
-                  new_relative_path = f"{dir_name}/{new_name}" if dir_name else new_name
-                  old_full_path = f"{TARGET_DIR}/{relative_path}"
-                  new_full_path = f"{TARGET_DIR}/{new_relative_path}"
-                  print(f"📝 {relative_path}  -->  {new_relative_path}")
-                  if DO_RENAME:
-                      subprocess.run(['rclone', 'moveto', old_full_path, new_full_path])
-                  counter += 1
-
-          print("------------------------")
-          if not DO_RENAME:
-              print(f"\n✅ 演习完毕！找到 {counter - 1} 个文件。")
-          else:
-              print(f"\n🎉 搞定！")
