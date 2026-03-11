@@ -1,41 +1,73 @@
-name: 10TB全量自动大搬迁
+name: 🚀 专属行动：批量洗名字
 
 on:
-  workflow_dispatch:
-  schedule:
-    # 每天北京时间 0点、6点、12点、18点 自动启动
-    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch: # 只允许手动点击运行
 
 jobs:
-  Transfer:
+  rename_job:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. 环境初始化
-        run: curl -s https://rclone.org/install.sh | sudo bash > /dev/null 2>&1
+      - name: 1. 环境初始化 (安装 Rclone)
+        run: |
+          sudo -v ; curl https://rclone.org/install.sh | sudo bash
 
-      - name: 2. 注入保险柜凭证
+      - name: 2. 注入保险柜凭证 (读取配置)
         run: |
           mkdir -p ~/.config/rclone
-          # PikPak 配置
-          rclone config create pikpak pikpak user "${{ secrets.PIKPAK_USER }}" pass "${{ secrets.PIKPAK_PASS }}" > /dev/null 2>&1
-          # 123云盘 配置 (修复了 User-Agent 导致的奇数报错)
-          rclone config create 123pan webdav url "https://webdav.123pan.cn/webdav" vendor "other" user "${{ secrets.PAN123_USER }}" pass "${{ secrets.PAN123_PASS }}" headers "User-Agent,Mozilla/5.0" > /dev/null 2>&1
+          # 默认读取你仓库里存好的 RCLONE_CONF 密钥
+          echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
 
-      - name: 3. 执行高强度增量同步
+      - name: 3. 终极批量洗名字 (演习模式)
+        shell: python
         run: |
-          # 开启 10TB 大迁移
-          rclone copy "pikpak:/" "123pan:/PikPak全量备份" \
-            --size-only \
-            --ignore-checksum \
-            --fast-list \
-            --transfers 4 \
-            --checkers 8 \
-            --tpslimit 8 \
-            --stats 60s \
-            --ignore-errors \
-            --retries 5 \
-            --timeout 5m
+          import subprocess
+          import json
+          import os
 
-            --ignore-errors \
-            --retries 5 \
-            --timeout 5m
+          # 🎯 目标文件夹已经锁定
+          TARGET_DIR = "pikpak:/#AndMlove"
+          
+          # 🛡️ 安全开关：False为演习预览，True为正式动刀
+          DO_RENAME = False
+
+          print(f"🔍 正在深度穿透扫描 [{TARGET_DIR}] 及其所有子文件夹...")
+          cmd = ['rclone', 'lsjson', '-R', TARGET_DIR]
+          result = subprocess.run(cmd, capture_output=True, text=True)
+
+          if result.returncode != 0:
+              print("❌ 读取失败，请检查路径是否拼写正确。")
+              print(result.stderr)
+              exit(1)
+
+          files = json.loads(result.stdout)
+          counter = 1
+
+          print("\n--- 📋 预计改名清单 ---")
+          for f in files:
+              if not f['IsDir']:  
+                  relative_path = f['Path'] 
+                  dir_name = os.path.dirname(relative_path)
+                  ext = os.path.splitext(relative_path)[1] 
+                  
+                  new_name = f"{counter}{ext}"
+                  
+                  if dir_name:
+                      new_relative_path = f"{dir_name}/{new_name}"
+                  else:
+                      new_relative_path = new_name
+                      
+                  old_full_path = f"{TARGET_DIR}/{relative_path}"
+                  new_full_path = f"{TARGET_DIR}/{new_relative_path}"
+                  
+                  print(f"📝 {relative_path}  -->  {new_relative_path}")
+                  
+                  if DO_RENAME:
+                      subprocess.run(['rclone', 'moveto', old_full_path, new_full_path])
+                      
+                  counter += 1
+
+          print("------------------------")
+          if not DO_RENAME:
+              print(f"\n✅ 演习扫描完毕！预计将把 {counter - 1} 个文件打上数字编号。")
+          else:
+              print(f"\n🎉 搞定！改名完成。")
