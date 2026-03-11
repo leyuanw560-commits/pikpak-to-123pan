@@ -4,102 +4,70 @@ on:
   workflow_dispatch:
     inputs:
       force_full:
-        description: '强制全量扫描（跳过--max-age限制）'
+        description: '强制全量扫描'
         required: false
         default: 'false'
         type: choice
         options: ['true', 'false']
   schedule:
-    # 北京时间 0, 6, 12, 18 点自动触发
     - cron: '0 16,22,4,10 * * *'
+
+# 🔐 关键修复：显式增加权限，允许脚本触发自己
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   Transfer:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-    env:
-      MAX_AGE_HOURS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_full == 'true' && '0' || '24' }}
-      STATE_FILE: "PikPak 全量备份/.rclone_state"
+    # 移除 Job 级别的 timeout，改为由 Step 决定
     steps:
       - name: 1. 环境初始化
         run: |
-          echo "🔧 初始化环境 [$(date '+%Y-%m-%d %H:%M:%S')]"
           curl -s https://rclone.org/install.sh | sudo bash > /dev/null 2>&1
           mkdir -p ~/rclone_logs
-          echo "RUN_START_TS=$(date +%s)" >> $GITHUB_ENV
 
       - name: 2. 注入保险柜凭证
         run: |
           mkdir -p ~/.config/rclone
-          # 自动创建配置，无需手动维护 rclone.conf
           rclone config create pikpak pikpak user "${{ secrets.PIKPAK_USER }}" pass "${{ secrets.PIKPAK_PASS }}" > /dev/null 2>&1
           rclone config create 123pan webdav url "https://webdav.123pan.cn/webdav" vendor "other" user "${{ secrets.PAN123_USER }}" pass "${{ secrets.PAN123_PASS }}" headers "User-Agent,Mozilla/5.0" > /dev/null 2>&1
-          echo "✅ 凭证注入完成"
 
-      - name: 3. 读取同步状态（智能对账）
+      - name: 3. 读取同步状态
         id: state
         run: |
+          MAX_AGE_HOURS=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_full == 'true' && '0' || '24' }}
+          STATE_FILE="PikPak 全量备份/.rclone_state"
           MAX_AGE_FLAG=""
-          if [[ "${{ env.MAX_AGE_HOURS }}" == "0" ]]; then
-            echo "🔥 强制全量扫描"
-            echo "max_age_flag=" >> $GITHUB_OUTPUT
-          else
-            LAST_FULL_TS=$(rclone cat "123pan:/${{ env.STATE_FILE }}" 2>/dev/null | grep "last_full_sync" | cut -d'=' -f2 || echo "0")
-            NOW_TS=$(date +%s)
-            if [[ $(( (NOW_TS - LAST_FULL_TS) / 86400 )) -ge 7 ]]; then
-              echo "📅 超过7天，自动全量校验"
-              echo "max_age_flag=" >> $GITHUB_OUTPUT
-              echo "last_full_sync=$NOW_TS" > ~/state_tmp.txt
-              rclone copyto ~/state_tmp.txt "123pan:/${{ env.STATE_FILE }}" --force 2>/dev/null || true
-            else
-              echo "⚡ 增量模式：仅比对 24h 内文件"
-              echo "max_age_flag=--max-age ${{ env.MAX_AGE_HOURS }}h" >> $GITHUB_OUTPUT
+          if [[ "$MAX_AGE_HOURS" != "0" ]]; then
+            LAST_FULL_TS=$(rclone cat "123pan:/$STATE_FILE" 2>/dev/null | grep "last_full_sync" | cut -d'=' -f2 || echo "0")
+            if [[ $(( ($(date +%s) - LAST_FULL_TS) / 86400 )) -lt 7 ]]; then
+              MAX_AGE_FLAG="--max-age ${MAX_AGE_HOURS}h"
             fi
           fi
+          echo "max_age_flag=$MAX_AGE_FLAG" >> $GITHUB_OUTPUT
 
-      - name: 4. 执行断点续传同步
+      - name: 4. 执行同步 (限时 340 分钟)
         id: sync
+        # 💡 这里是关键：给搬运设置 340 分钟限时，给第 5 步留出 10 分钟时间“点火”
+        timeout-minutes: 340
+        continue-on-error: true
         run: |
-          # 核心搬运命令
-          RCLONE_CMD="rclone copy pikpak:/ 123pan:/PikPak全量备份 \
-            --size-only \
-            --ignore-checksum \
-            --fast-list \
-            --transfers 4 \
-            --checkers 8 \
-            --tpslimit 8 \
-            --buffer-size 64M \
-            --stats 60s \
-            --ignore-errors \
-            --retries 3 \
-            --timeout 10m \
-            --contimeout 30s \
-            --log-file ~/rclone_logs/sync.log \
-            --log-level INFO"
-          
-          if [[ -n "${{ steps.state.outputs.max_age_flag }}" ]]; then
-            RCLONE_CMD="$RCLONE_CMD ${{ steps.state.outputs.max_age_flag }}"
-          fi
-          
-          bash -c "$RCLONE_CMD"
-          EXIT_CODE=$?
-          
-          # 判断是否需要重试（137代表被GitHub杀掉，需要重跑）
-          if [[ $EXIT_CODE -eq 137 ]] || [[ $EXIT_CODE -gt 0 && $EXIT_CODE -lt 128 ]]; then
-            echo "need_retry=true" >> $GITHUB_OUTPUT
-          else
-            echo "need_retry=false" >> $GITHUB_OUTPUT
-          fi
-          exit $EXIT_CODE
+          rclone copy pikpak:/ 123pan:/PikPak全量备份 \
+            --size-only --ignore-checksum --fast-list --transfers 4 --checkers 8 \
+            --tpslimit 8 --buffer-size 64M --stats 60s --ignore-errors --retries 3 \
+            --timeout 10m --contimeout 30s --log-file ~/rclone_logs/sync.log --log-level INFO ${{ steps.state.outputs.max_age_flag }}
 
-      - name: 5. 自动重触发
-        if: always() && steps.sync.outputs.need_retry == 'true'
+      - name: 5. 自动重触发 (无论成败)
+        # 💡 逻辑修改：只要第 4 步没搬完（报错或超时），就触发下一轮
+        if: always() && (steps.sync.outcome == 'failure' || steps.sync.outcome == 'timed_out')
         run: |
-          echo "🔄 触发自动重跑..."
+          echo "🔄 搬运未完成，正在接力启动新任务..."
           curl -L \
             -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/run.yml/dispatches \
             -d '{"ref": "${{ github.ref }}", "inputs": {"force_full": "false"}}'
 
@@ -109,4 +77,6 @@ jobs:
         with:
           name: rclone-logs-run-${{ github.run_number }}
           path: ~/rclone_logs/*.log
-          retention-days: 3
+
+
+      
