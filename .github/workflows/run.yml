@@ -59,7 +59,7 @@ jobs:
         # Rclone 退出码 8 代表 max-duration 时间到了，143 代表被系统强杀
         if: steps.sync.outputs.exit_code == '8' || steps.sync.outputs.exit_code == '143'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           echo "⏳ 达到安全运行时长极限 (5小时45分)，正在自动召唤下一波接力..."
           gh workflow run "${{ github.workflow }}" || echo "❌ 触发接力失败，请检查仓库 Settings 的读写权限！"
